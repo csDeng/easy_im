@@ -1,0 +1,25 @@
+[
+  {"msg":"认证包"},
+{
+  "type": 10002,
+  "target":1,
+  "content":"{\"id\":2,\"userName\":\"name2\",\"userPwd\":\"pwd2\"}"
+},
+
+  {
+    "type": 10002,
+    "target":2,
+    "content":"{\"id\":1,\"userName\":\"name1\",\"userPwd\":\"pwd1\"}"
+  },
+
+
+  {"msg":"聊天"},
+{
+  "type": 10002,
+  "target":"hah",
+  "content":"hello"
+}
+
+
+
+]

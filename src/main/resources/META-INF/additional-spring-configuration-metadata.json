@@ -1,0 +1,8 @@
+{
+  "properties": [
+    {
+      "name": "cfg.ws-port",
+      "type": "java.lang.String",
+      "description": "websocket 启动的端口."
+  }
+] }
