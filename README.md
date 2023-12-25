@@ -340,3 +340,362 @@ public abstract class SimpleChannelInboundHandler<I> extends ChannelInboundHandl
 ![image-20231005161115373](./README//image-20231005161115373.png)
 
 ![image-20231005161210629](./README//image-20231005161210629.png)
+
+
+# 项目代码核心代码
+
+> 接下来是代码展示环节，感兴趣的可以到项目仓库：https://github.com/csDeng/easy_im/tree/master
+获取完整代码。
+
+⚠️：值得注意的是本项目仅仅是一个demo级别，跟生产级别无法相比哦～
+
+笔者在生产环境使用时，已根据实际业务作出相应调整。
+
+## im服务启动类
+
+```java
+
+@Slf4j
+@Component
+public class Server {
+
+    private Channel channel;
+
+    @Value("${cfg.ws-port}")
+    private Integer port;
+
+    @Resource
+    private WebsocketHandler websocketHandler;
+
+
+    private final NioEventLoopGroup boss = new NioEventLoopGroup();
+    private final NioEventLoopGroup worker = new NioEventLoopGroup();
+
+    @PostConstruct
+    public void start() throws InterruptedException {
+        ServerBootstrap bootstrap = new ServerBootstrap();
+        bootstrap.option(ChannelOption.TCP_NODELAY, true)
+                .option(ChannelOption.SO_KEEPALIVE, true)
+                .group(boss, worker)
+                .channel(NioServerSocketChannel.class)
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel socketChannel) throws Exception {
+                        ChannelPipeline pipeline = socketChannel.pipeline();
+                        // HttpServerCodec is a class provided by Netty which does the decoding and encoding for incoming requests.
+                        pipeline.addLast(new HttpServerCodec())
+                                .addLast(new ChunkedWriteHandler())
+                                // http 消息聚合操作 -> FullHttpRequest FullHttpResponse
+                                .addLast(new HttpObjectAggregator(1024 * 64))
+                                // websocket 自动握手连接
+                                .addLast(new WebSocketServerProtocolHandler("/"))
+
+                                // 身份认证
+                                .addLast(new AuthHandler())
+
+                                // websocket handler
+                                .addLast(websocketHandler);
+                    }
+                });
+        ChannelFuture future = bootstrap.bind(port).sync();
+        if (!future.isSuccess()) {
+            log.error("服务启动失败");
+            return;
+        }
+        log.info("netty server has bind :8000");
+        channel = future.channel();
+
+    }
+
+    @PreDestroy
+    public void shutdown() throws InterruptedException {
+        if (channel != null) {
+            // 关闭 Netty Server
+            channel.close().sync();
+        }
+        //优雅关闭两个 EventLoopGroup 对象
+        boss.shutdownGracefully();
+        worker.shutdownGracefully();
+    }
+}
+
+```
+
+## `AuthHandler` 认证 `handler`
+
+```java
+@Slf4j
+public class AuthHandler extends SimpleChannelInboundHandler<TextWebSocketFrame> {
+
+    private static final Gson gs = new Gson();
+
+    private static final long AUTH_TIMEOUT = 30; // 3分钟，单位为秒
+
+    private static final long REMINDER_INTERVAL = 5; // 单位为秒
+
+    private ScheduledFuture<?> timeoutFuture;
+    private ScheduledFuture<?> reminderFuture;
+
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx){
+        startHelper(ctx);
+
+    }
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, TextWebSocketFrame frame) throws Exception {
+        String text = frame.text();
+
+        try {
+            ChatMsg chatMsg = gs.fromJson(text, ChatMsg.class);
+            if(chatMsg.getType() != CommandTypeEnum.AUTH) {
+                sendAuthResponse(ctx, false, "请先传输认证数据包！");
+                return;
+            }
+            String token = (String) chatMsg.getContent();
+            if (StringUtils.isBlank(token)) {
+                sendAuthResponse(ctx, false, "请提供有效的令牌");
+                return;
+            }
+
+            boolean isValidToken = TokenUtil.checkToken(token);
+            if (!isValidToken) {
+                sendAuthResponse(ctx, false, "令牌失效，请重新获取令牌");
+                return;
+            }
+
+            sendAuthResponse(ctx, false, "认证成功");
+            User user = TokenUtil.parseToken(token);
+
+            // 将认证处理器从pipe删除
+            ctx.channel().pipeline().remove(this);
+
+            // 注意删除后再添加 channel 会话，不然没办法反向获取 userId
+            SessionManager.addSession(user.getId(), ctx);
+            stopHelper();
+        } catch (Exception e) {
+            sendAuthResponse(ctx, false, "请确认数据格式");
+            log.error("认证错误{}", e.getMessage());
+        }
+
+    }
+
+
+    private void sendAuthResponse(ChannelHandlerContext ctx, boolean close, String message) {
+        ChatMsg<String> chatMsg = ChatMsg.<String>builder()
+                .type(CommandTypeEnum.SYSTEM)
+                .content(message)
+                .build();
+        String responseJson = gs.toJson(chatMsg);
+        ctx.channel().writeAndFlush(new TextWebSocketFrame(responseJson));
+        if (close) {
+            log.info("认证失败");
+            ctx.close();
+        }
+    }
+
+    private void startAuthTimeoutTimer(ChannelHandlerContext ctx) {
+        timeoutFuture = ctx.executor().schedule(() -> {
+            log.info("连接关闭");
+            sendAuthResponse(ctx, true, "超时未接收到认证包，连接关闭");
+            cancelAuthReminderTimer();
+        }, AUTH_TIMEOUT, TimeUnit.SECONDS);
+    }
+
+    private void cancelAuthTimeoutTimer() {
+        if (timeoutFuture != null && !timeoutFuture.isDone()) {
+            timeoutFuture.cancel(true);
+        }
+    }
+
+    private void startAuthReminderTimer(ChannelHandlerContext ctx) {
+        reminderFuture = ctx.executor().scheduleAtFixedRate(() -> {
+            // 在每一分钟执行的操作
+            // 发送催促认证消息
+            log.info("催促认证");
+            sendAuthResponse(ctx, false, "请尽快进行认证");
+        }, REMINDER_INTERVAL, REMINDER_INTERVAL, TimeUnit.SECONDS);
+    }
+
+    private void cancelAuthReminderTimer() {
+        if (reminderFuture != null && !reminderFuture.isDone()) {
+            reminderFuture.cancel(true);
+        }
+    }
+
+    private void startHelper(ChannelHandlerContext ctx) {
+        startAuthTimeoutTimer(ctx);
+        startAuthReminderTimer(ctx);
+    }
+
+    private void stopHelper() {
+        cancelAuthTimeoutTimer();
+        cancelAuthReminderTimer();
+    }
+}
+```
+
+## `WebsocketHandler`
+
+```java
+@Component
+@ChannelHandler.Sharable
+public class WebsocketHandler extends SimpleChannelInboundHandler<TextWebSocketFrame> {
+
+    @Resource
+    private ChatHandler chatHandler;
+
+    @Override
+    public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
+        log.info("{} channelRegistered", ctx.channel());
+        super.channelRegistered(ctx);
+    }
+
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        log.error("发生异常, e="+cause);
+    }
+
+    @Override
+    public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
+        log.info("{} channelUnregistered", ctx.channel());
+        SessionManager.removeSession(ctx);
+        super.channelUnregistered(ctx);
+    }
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, TextWebSocketFrame textWebSocketFrame) {
+        chatHandler.execute(ctx, textWebSocketFrame);
+    }
+}
+
+```
+
+## `ChatHandler`
+
+```java
+@Component
+@ChannelHandler.Sharable
+public class ChatHandler {
+
+    @Resource
+    private MsgDao msgDao;
+
+
+    private static final Gson gs = new Gson();
+
+    public void execute(ChannelHandlerContext ctx, TextWebSocketFrame frame) {
+        try {
+            Gson gson = Singleton.gson;
+            ChatMsg chatMsg = gson.fromJson(frame.text(), ChatMsg.class);
+            switch (chatMsg.getType()) {
+                case PRIVATE_CHAT -> {
+                    log.info("private");
+                    Integer target = chatMsg.getTarget();
+                    if(target == null) {
+                        sendMsg(ctx, "请指定消息接收者");
+                        return;
+                    }
+                    Integer userId = SessionManager.getUserId(ctx);
+                    if(userId == -1) {
+                        sendMsg(ctx, "获取自身userId失败");
+                        return;
+                    }
+                    log.info("给{}发送消息", target);
+                    Msg msg = new Msg();
+                    msg.setFromUserId(userId);
+                    msg.setToUserId(target);
+                    msg.setContent(chatMsg.getContent().toString());
+                    ChannelHandlerContext session = SessionManager.getSession(target);
+                    if(session == null) {
+                        sendMsg(ctx, "userId="+ target + "不在线");
+                        msg.setHasRead(0);
+                        msgDao.save(msg);
+                        return;
+                    }
+                    sendMsg(session, chatMsg.getContent().toString());
+                    msg.setHasRead(1);
+                    msgDao.save(msg);
+                }
+                default -> sendMsg(ctx,"暂不支持当前消息类型");
+            }
+        }catch (Exception e) {
+            log.error(ChatHandler.class.getSimpleName() + "occurs error: {}", e.getMessage());
+            sendMsg(ctx, "数据格式有误");
+        }
+    }
+
+    private void sendMsg(ChannelHandlerContext ctx, String data) {
+        ChatMsg<String> chatMsg = ChatMsg.<String>builder()
+                .type(CommandTypeEnum.SYSTEM)
+                .content(data)
+                .build();
+        String responseJson = gs.toJson(chatMsg);
+        ctx.channel().writeAndFlush(new TextWebSocketFrame(responseJson));
+    }
+
+}
+
+```
+
+## `SessionManager`
+
+```java
+
+/**
+ * 会话管理
+ * 用于提供对session链接、断开连接、推送消息的简单控制。
+ */
+@Slf4j
+public class SessionManager {
+    /**
+     * 记录当前在线的 ChannelHandlerContext
+     */
+    private static final Map<Integer, ChannelHandlerContext> ONLINE_SESSION = new ConcurrentHashMap<>();
+
+    private static final Map<ChannelId, Integer> USER = new ConcurrentHashMap<>();
+
+    public static void addSession(Integer userId, ChannelHandlerContext ctx) {
+        // 此处只允许一个用户的session链接。一个用户的多个连接，我们视为无效。
+        ONLINE_SESSION.putIfAbsent(userId, ctx);
+        ChannelId id = ctx.channel().id();
+        USER.putIfAbsent(id, userId);
+        log.info("userId:{} 添加会话成功, channelId:{}", userId, id);
+    }
+
+    public static ChannelHandlerContext getSession(Integer userId) {
+        return ONLINE_SESSION.getOrDefault(userId, null);
+    }
+
+    public static Integer getUserId(ChannelHandlerContext ctx) {
+        ChannelId id = ctx.channel().id();
+        return USER.getOrDefault(id, -1);
+    }
+
+    /**
+     * 关闭session
+     */
+    public static void removeSession(ChannelHandlerContext ctx) {
+        ChannelId id = ctx.channel().id();
+        Integer userId = USER.getOrDefault(id, -1);
+        ONLINE_SESSION.remove(userId);
+        USER.remove(id);
+        log.info("userId:{} channelId={} 删除会话成功", userId, id);
+    }
+
+    /**
+     * 给单个用户推送消息
+     */
+    public static void sendMessage(ChannelHandlerContext ctx, ChatMsg<?> msg) {
+        if (ctx == null) {
+            return;
+        }
+        ctx.channel().writeAndFlush(new TextWebSocketFrame(Singleton.gson.toJson(msg)));
+    }
+}
+
+```
+
+
